@@ -47,21 +47,16 @@ __BEGIN_DECLS
     char* igraph_i_strndup(const char *s, size_t n);
 #endif
 
-#ifndef HAVE_STRCASECMP
-    #ifdef HAVE__STRICMP
-        #define strcasecmp _stricmp
-    #else
-        #error "igraph needs strcasecmp() or _stricmp()"
-    #endif
+
+#ifdef HAVE__STRICMP
+    #define strcasecmp _stricmp
 #endif
 
-#ifndef HAVE_STRNCASECMP
-    #ifdef HAVE__STRNICMP
-        #define strncasecmp _strnicmp
-    #else
-        #error "igraph needs strncasecmp() or _strnicmp()"
-    #endif
+
+#ifdef HAVE__STRNICMP
+    #define strncasecmp _strnicmp
 #endif
+
 
 /* Magic macro to fail the build if certain condition does not hold. See:
  * https://stackoverflow.com/questions/4079243/how-can-i-use-sizeof-in-a-preprocessor-macro
