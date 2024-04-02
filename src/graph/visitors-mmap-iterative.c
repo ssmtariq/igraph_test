@@ -32,46 +32,22 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
-#define CHUNK_SIZE 10240 // Desired chunk size in bytes
+#define CHUNK_SIZE 4096*2 // Desired chunk size in bytes
 
-igraph_integer_t *mapped_order;
-igraph_integer_t remaining_elements = no_of_elements;
-igraph_integer_t offset = 0;
-
-igraph_error_t unmap_order(igraph_integer_t **mapped_order, igraph_integer_t chunk_size){
-    if (munmap(*mapped_order, chunk_size * sizeof(igraph_integer_t)) == -1) {
+unmap_order(igraph_integer_t *mapped_order, igraph_integer_t *actual_chunk_size){
+    if (munmap(mapped_order, actual_chunk_size) == -1) {
         perror("munmap");
         return IGRAPH_EFILE;
     }
-    return IGRAPH_SUCCESS;
 }
 
 // Memory map the order vector to a file
-igraph_error_t memory_map_order_iterative(igraph_vector_int_t *order, const char *order_filename, igraph_integer_t **mapped_order, igraph_integer_t no_of_elements, igraph_integer_t *remaining_elements, igraph_integer_t *offset) {
-    int fd;
-
-    // Open the file for memory mapping
-    fd = open(order_filename, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
-    if (fd == -1) {
-        perror("open");
-        return IGRAPH_EFILE;
-    }
-
-    // Resize the file to accommodate the order data
-    if (ftruncate(fd, no_of_elements * sizeof(igraph_integer_t)) == -1) {
-        perror("ftruncate");
-        close(fd);
-        return IGRAPH_EFILE;
-    }
-
+igraph_error_t memory_map_order_iterative(igraph_vector_int_t *order, int fd, igraph_integer_t **mapped_order, igraph_integer_t *actual_chunk_size, igraph_integer_t *remaining_elements, igraph_integer_t *offset) {
     // Memory-map the file iteratively in chunks
-    igraph_integer_t chunk_size = (*remaining_elements > CHUNK_SIZE) ? CHUNK_SIZE : *remaining_elements;
-
-    printf("Memory mapping is gonna start... the chunk_size=%d and offset=%d\n", chunk_size, *offset);
-    fflush(stdout);
+    *actual_chunk_size = ((*remaining_elements * sizeof(igraph_integer_t)) > CHUNK_SIZE) ? CHUNK_SIZE : (*remaining_elements * sizeof(igraph_integer_t));
 
     // Memory-map the current chunk
-    *mapped_order = mmap(NULL, chunk_size * sizeof(igraph_integer_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, (*offset * sizeof(igraph_integer_t)));
+    *mapped_order = mmap(0, *actual_chunk_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, *offset);
     if (*mapped_order == MAP_FAILED) {
         perror("mmap");
         close(fd);
@@ -79,18 +55,11 @@ igraph_error_t memory_map_order_iterative(igraph_vector_int_t *order, const char
     }
 
     // Update offsets and remaining elements for the next iteration
-    *offset += chunk_size;
-    *remaining_elements -= chunk_size;
-    printf("New value of offset=%d, chunk_size=%d, remaining_elements=%d !\n", *offset, chunk_size, *remaining_elements);
-
-    printf("Memory is mapped successfully in memory_map_order() !\n");
-    fflush(stdout);
-
-    // Close the file descriptor
-    close(fd);
+    *offset += *actual_chunk_size;
+    *remaining_elements -= (*actual_chunk_size/sizeof(igraph_integer_t));
 
     // Initialize the order vector to use the memory-mapped data directly
-    igraph_vector_int_view(order, *mapped_order, no_of_elements);
+    igraph_vector_int_view(order, *mapped_order, (*actual_chunk_size/sizeof(igraph_integer_t)));
 
     return IGRAPH_SUCCESS;
 }
@@ -238,22 +207,33 @@ igraph_error_t igraph_bfs(const igraph_t *graph,
         }
     }
 
-    /* Resize result vectors, and fill them with the initial value. */
-
-    Memory-map the order vector
     igraph_integer_t *mapped_order = NULL;
-    // printf("no_of_nodes=%d\n", no_of_nodes);
-    igraph_integer_t remaining_elements = 999998;
+    printf("no_of_nodes=%d\n", no_of_nodes);
+    igraph_integer_t remaining_elements = no_of_nodes;
     igraph_integer_t offset = 0;
+    igraph_integer_t actual_chunk_size;
+    int fd;
+    igraph_integer_t order_index = 0;
+
+    // Open the file for memory mapping
+    fd = open("/tmp/orders_map.bin", O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
+    if (fd == -1) {
+        perror("open");
+        return IGRAPH_EFILE;
+    }
+
+    // Resize the file to accommodate the order data
+    if (ftruncate(fd, no_of_nodes * sizeof(igraph_integer_t)) == -1) {
+        perror("ftruncate");
+        close(fd);
+        return IGRAPH_EFILE;
+    }
 
     igraph_error_t is_map_success;
-    printf("Mapping order vector memory!\n");
-    is_map_success = memory_map_order_iterative(order, "/tmp/orders_map.bin", &mapped_order, no_of_nodes, &remaining_elements, &offset);
+    is_map_success = memory_map_order_iterative(order, fd, &mapped_order, &actual_chunk_size, &remaining_elements, &offset);
     if (is_map_success != IGRAPH_SUCCESS) {
         return is_map_success;
     }
-    printf("Successfully mapped memory of order vector!\n");
-    fflush(stdout);
 
 # define VINIT(v, initial) \
     if (v) { \
@@ -322,28 +302,18 @@ igraph_error_t igraph_bfs(const igraph_t *graph,
                 VECTOR(*rank)[actvect] = act_rank;
             }
             if (order) {
-                if(act_rank>0 && act_rank%CHUNK_SIZE==0){
-                    // printf("Going to unmap memory when index = %d\n", act_rank);
-                    // fflush(stdout);
-                    igraph_error_t unmap_error = unmap_order(&mapped_order, CHUNK_SIZE);
-                    if (unmap_error != IGRAPH_SUCCESS) {
-                        return unmap_error; // Handle error appropriately
-                    }
-                    // printf("Memory unmap successful\n");
-                    // fflush(stdout);
+                if(act_rank>0 && (act_rank%(CHUNK_SIZE/sizeof(igraph_integer_t))==0)){
+                    order_index = 0;
+                    unmap_order(mapped_order, actual_chunk_size);
+
                     igraph_error_t is_map_success;
-                    is_map_success = memory_map_order_iterative(order, "/tmp/orders_map.bin", &mapped_order, no_of_nodes, &remaining_elements, &offset);
+                    is_map_success = memory_map_order_iterative(order, fd, &mapped_order, &actual_chunk_size, &remaining_elements, &offset);
                     if (is_map_success != IGRAPH_SUCCESS) {
                         return is_map_success;
                     }
-                    printf("Memory remapping successful\n");
-                    fflush(stdout);
                 }
-                // printf("Updating order vector data index=%d and value=%d\n", act_rank, actvect);
-                // fflush(stdout);
-                VECTOR(*order)[act_rank++] = actvect;
-                // printf("Vector update successful!\n");
-                // fflush(stdout);
+                VECTOR(*order)[order_index++] = actvect;
+                act_rank++;
             }
             if (dist) {
                 VECTOR(*dist)[actvect] = actdist;
@@ -384,16 +354,24 @@ igraph_error_t igraph_bfs(const igraph_t *graph,
         } /* while Q !empty */
 
     } /* for actroot < no_of_nodes */
+    unmap_order(mapped_order, actual_chunk_size);
+
+    // igraph_vector_int_init(order, 0);
+    // igraph_vector_int_resize(order, no_of_nodes);
+    // // Read the data from the file and store it into the vector order
+    // if (read(fd, VECTOR(*order), no_of_nodes * sizeof(igraph_integer_t)) == -1) {
+    //     close(fd);
+    //     perror("Error reading the file");
+    //     return 1;
+    // }
+
+    close(fd);
+
     end = clock();
     execution_time = ((double) (end - start)) / CLOCKS_PER_SEC;
-    // printf("Execution time of igraph_bfs: %f seconds\n", execution_time);
-    // fflush(stdout);
-    igraph_error_t unmap_error = unmap_order(&mapped_order, 999998 * sizeof(igraph_integer_t));
-    if (unmap_error != IGRAPH_SUCCESS) {
-        return unmap_error; // Handle error appropriately
-    }
-    // printf("Memory unmap successful\n");
-    // fflush(stdout);
+    printf("Execution time of igraph_bfs: %f seconds\n", execution_time);
+    fflush(stdout);
+
 cleanup:
 
     igraph_lazy_adjlist_destroy(&adjlist);
